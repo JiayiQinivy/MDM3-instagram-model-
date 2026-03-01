@@ -9,7 +9,7 @@ stories_viewed_per_day
 time_on_feed_per_day
 posts_created_per_week
 average_session_length_minutes
-time_on_messages_per_day
+time_on_messages_per_day 
 reels_watched_per_day
 time_on_explore_per_day
 dms_received_per_week
