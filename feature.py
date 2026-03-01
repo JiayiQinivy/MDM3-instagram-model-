@@ -1,23 +1,8 @@
-# -*- coding: utf-8 -*-
-"""
-Lightweight hybrid feature selection for psychological risk (NO permutation importance, NO forced keep)
-
-Methods used:
-1) Mutual Information (filter)
-2) Elastic Net (embedded)
-3) ExtraTrees builtin importance (tree-based)
-4) Rank aggregation (average rank)
-
-Outputs:
-- feature_importance_rankings_psych_risk_light_noforced.csv
-- selected_features_top20_psych_risk_light_noforced.txt
-"""
-
 import warnings
 warnings.filterwarnings("ignore")
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from pathlib import Path
 
 from sklearn.impute import SimpleImputer
@@ -30,142 +15,93 @@ from sklearn.ensemble import ExtraTreesRegressor
 
 
 # =========================
-# CONFIG (edit these first if needed)
+# CONFIG
 # =========================
-INPUT = Path("instagram_usage_lifestyle_analysis_ready.csv")
+INPUT = Path("instagram_usage_lifestyle.csv")
 
-# Final research target (continuous psychological risk score recommended)
+# We build psychological_risk from these two original columns (as LABEL only)
+STRESS_COL = "perceived_stress_score"
+HAPPY_COL = "self_reported_happiness"
 TARGET = "psychological_risk"
 
-# If TARGET does not exist, optionally construct it from stress/happiness (example only)
-CONSTRUCT_TARGET_IF_MISSING = True
-
-# Columns to always drop from features
+# Do NOT use ID-like columns as features
 DROP_COLS = ["user_id"]
 
-# IMPORTANT: columns used to construct psychological risk should NOT be used as predictors
-# Edit this list according to your actual psychological_risk definition
-LEAKAGE_COLS = [
-    "perceived_stress_score",
-    "self_reported_happiness",
-]
+# Leak prevention: columns used to build TARGET should not be predictors
+LEAKAGE_COLS = [STRESS_COL, HAPPY_COL]
 
 TOP_K = 20
 RANDOM_STATE = 42
 
-# Sampling sizes for speed (adjust by machine)
+# Sampling for speed (adjust to your machine)
 N_SAMPLE_MI = 200_000
 N_SAMPLE_ENET = 120_000
 N_SAMPLE_TREE = 200_000
 
-# Output files
-OUT_RANK = Path("feature_importance_rankings_psych_risk_light_noforced.csv")
-OUT_TOPK = Path(f"selected_features_top{TOP_K}_psych_risk_light_noforced.txt")
+OUT_RANK = Path("feature_importance_rankings_psych_risk.csv")
+OUT_TOPK = Path(f"selected_features_top{TOP_K}_psych_risk.txt")
 
 
 # =========================
-# Utilities
+# Helpers
 # =========================
-def sample_xy(X, y, n, random_state=42):
+def sample_xy(X, y, n, seed=42):
     if len(X) <= n:
         return X.copy(), y.copy()
-    rng = np.random.RandomState(random_state)
+    rng = np.random.RandomState(seed)
     idx = rng.choice(len(X), size=n, replace=False)
     return X.iloc[idx].copy(), y.iloc[idx].copy()
 
-
 def safe_onehot():
-    """Compatibility for sklearn versions (Python 3.8 envs often have older sklearn)."""
+    # sklearn compatibility (older versions use sparse=, newer uses sparse_output=)
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=True)
     except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=True)
 
+def to_numeric_inplace(df, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-def maybe_engineer_behavior_indices(df):
+def convert_date_inplace(df, col="last_login_date"):
     """
-    Optional composite indices aligned with project theme.
-    Creates columns only if required components exist.
+    Use only original column, no new feature names.
+    Convert date string to numeric (days since Unix epoch).
     """
-    df = df.copy()
+    if col not in df.columns:
+        return
+    dt = pd.to_datetime(df[col], errors="coerce", utc=True)
+    # days since epoch (float) -> numeric
+    df[col] = (dt.view("int64") // (10**9) / 86400).astype("float64")
 
-    # 1) Passive Consumption Index (example proxy)
-    if all(c in df.columns for c in [
-        "reels_watched_per_day",
-        "stories_viewed_per_day",
-        "time_on_feed_per_day",
-        "time_on_reels_per_day",
-        "daily_active_minutes_instagram"
-    ]):
-        denom = pd.to_numeric(df["daily_active_minutes_instagram"], errors="coerce").replace(0, np.nan)
-        passive_numer = (
-            pd.to_numeric(df["reels_watched_per_day"], errors="coerce").fillna(0) +
-            pd.to_numeric(df["stories_viewed_per_day"], errors="coerce").fillna(0) +
-            pd.to_numeric(df["time_on_feed_per_day"], errors="coerce").fillna(0) +
-            pd.to_numeric(df["time_on_reels_per_day"], errors="coerce").fillna(0)
-        )
-        df["passive_consumption_index"] = (passive_numer / denom).replace([np.inf, -np.inf], np.nan)
-        if df["passive_consumption_index"].isna().any():
-            df["passive_consumption_index"] = df["passive_consumption_index"].fillna(
-                df["passive_consumption_index"].median()
-            )
-
-    # 2) Doomscrolling Ratio (example proxy)
-    if all(c in df.columns for c in ["time_on_reels_per_day", "time_on_feed_per_day", "time_on_explore_per_day"]):
-        reels = pd.to_numeric(df["time_on_reels_per_day"], errors="coerce").fillna(0)
-        feed = pd.to_numeric(df["time_on_feed_per_day"], errors="coerce").fillna(0)
-        explore = pd.to_numeric(df["time_on_explore_per_day"], errors="coerce").fillna(0)
-        denom = (reels + feed + explore).replace(0, np.nan)
-        df["doomscrolling_ratio"] = (reels / denom).replace([np.inf, -np.inf], np.nan)
-        if df["doomscrolling_ratio"].isna().any():
-            df["doomscrolling_ratio"] = df["doomscrolling_ratio"].fillna(df["doomscrolling_ratio"].median())
-
-    return df
-
-
-def build_psychological_risk_if_needed(df):
+def build_psychological_risk(df):
     """
-    Example construction only.
-    Replace with your team's actual risk formula if needed.
+    TARGET = z(stress) - z(happiness)
+    Label only.
     """
-    if TARGET in df.columns:
-        return df
+    s = pd.to_numeric(df[STRESS_COL], errors="coerce")
+    h = pd.to_numeric(df[HAPPY_COL], errors="coerce")
 
-    if not CONSTRUCT_TARGET_IF_MISSING:
-        raise ValueError(
-            f"TARGET column '{TARGET}' not found. "
-            f"Either create it in your dataset or set CONSTRUCT_TARGET_IF_MISSING=True."
-        )
+    s_std = s.std(ddof=0)
+    h_std = h.std(ddof=0)
 
-    required = ["perceived_stress_score", "self_reported_happiness"]
-    if not all(c in df.columns for c in required):
-        raise ValueError(
-            f"Cannot construct '{TARGET}'. Missing required columns: "
-            f"{[c for c in required if c not in df.columns]}"
-        )
+    s_z = (s - s.mean()) / (s_std if pd.notna(s_std) and s_std != 0 else 1.0)
+    h_z = (h - h.mean()) / (h_std if pd.notna(h_std) and h_std != 0 else 1.0)
 
-    tmp = df[required].copy()
-    for c in required:
-        tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+    return (s_z - h_z).astype("float64")
 
-    stress = tmp["perceived_stress_score"]
-    happy = tmp["self_reported_happiness"]
-
-    stress_std = stress.std(ddof=0)
-    happy_std = happy.std(ddof=0)
-    stress_z = (stress - stress.mean()) / (stress_std if pd.notna(stress_std) and stress_std != 0 else 1.0)
-    happy_z = (happy - happy.mean()) / (happy_std if pd.notna(happy_std) and happy_std != 0 else 1.0)
-
-    # higher stress + lower happiness => higher risk
-    df[TARGET] = stress_z - happy_z
-    return df
+def detect_types(X):
+    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in X.columns if c not in num_cols]
+    return num_cols, cat_cols
 
 
 # =========================
-# Importance methods
+# Importance methods (lightweight)
 # =========================
-def compute_mi_importance(X, y, num_cols, cat_cols, n_sample=200_000, random_state=42):
-    Xs, ys = sample_xy(X, y, n_sample, random_state)
+def mi_importance(X, y, num_cols, cat_cols, n_sample, seed):
+    Xs, ys = sample_xy(X, y, n_sample, seed)
 
     X_num = Xs[num_cols].copy() if num_cols else pd.DataFrame(index=Xs.index)
     X_cat = Xs[cat_cols].copy() if cat_cols else pd.DataFrame(index=Xs.index)
@@ -177,8 +113,7 @@ def compute_mi_importance(X, y, num_cols, cat_cols, n_sample=200_000, random_sta
     if len(cat_cols) > 0:
         X_cat = X_cat.astype("string").fillna("Unknown")
         oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-        X_cat_enc = oe.fit_transform(X_cat)
-        X_cat_enc = pd.DataFrame(X_cat_enc, columns=cat_cols, index=X_cat.index)
+        X_cat_enc = pd.DataFrame(oe.fit_transform(X_cat), columns=cat_cols, index=X_cat.index)
     else:
         X_cat_enc = pd.DataFrame(index=Xs.index)
 
@@ -189,42 +124,36 @@ def compute_mi_importance(X, y, num_cols, cat_cols, n_sample=200_000, random_sta
         X_mi.values,
         ys.values,
         discrete_features=discrete_mask,
-        random_state=random_state
+        random_state=seed
     )
     return pd.Series(mi, index=X_mi.columns, name="mi_score")
 
-
-def compute_elasticnet_importance(X, y, num_cols, cat_cols, n_sample=120_000, random_state=42):
-    Xs, ys = sample_xy(X, y, n_sample, random_state)
+def enet_importance(X, y, num_cols, cat_cols, n_sample, seed):
+    Xs, ys = sample_xy(X, y, n_sample, seed)
 
     num_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler())
     ])
-
     cat_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("onehot", safe_onehot())
     ])
 
-    preprocessor = ColumnTransformer([
+    pre = ColumnTransformer([
         ("num", num_pipe, num_cols),
-        ("cat", cat_pipe, cat_cols)
+        ("cat", cat_pipe, cat_cols),
     ])
 
     model = ElasticNetCV(
         l1_ratio=[0.1, 0.5, 0.9, 0.95, 1.0],
         cv=5,
-        random_state=random_state,
+        random_state=seed,
         n_jobs=-1,
         max_iter=5000
     )
 
-    pipe = Pipeline([
-        ("prep", preprocessor),
-        ("model", model)
-    ])
-
+    pipe = Pipeline([("prep", pre), ("model", model)])
     pipe.fit(Xs, ys)
 
     coefs = pipe.named_steps["model"].coef_
@@ -249,9 +178,8 @@ def compute_elasticnet_importance(X, y, num_cols, cat_cols, n_sample=120_000, ra
 
     return pd.Series(importance, name="enet_abscoef")
 
-
-def compute_tree_builtin_importance(X, y, num_cols, cat_cols, n_sample=200_000, random_state=42):
-    Xs, ys = sample_xy(X, y, n_sample, random_state)
+def tree_builtin_importance(X, y, num_cols, cat_cols, n_sample, seed):
+    Xs, ys = sample_xy(X, y, n_sample, seed)
 
     X_num = Xs[num_cols].copy() if num_cols else pd.DataFrame(index=Xs.index)
     X_cat = Xs[cat_cols].copy() if cat_cols else pd.DataFrame(index=Xs.index)
@@ -265,8 +193,7 @@ def compute_tree_builtin_importance(X, y, num_cols, cat_cols, n_sample=200_000, 
     if len(cat_cols) > 0:
         X_cat = X_cat.astype("string").fillna("Unknown")
         oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-        X_cat_enc = oe.fit_transform(X_cat)
-        X_cat_enc = pd.DataFrame(X_cat_enc, columns=cat_cols, index=X_cat.index)
+        X_cat_enc = pd.DataFrame(oe.fit_transform(X_cat), columns=cat_cols, index=X_cat.index)
         for c in X_cat_enc.columns:
             X_cat_enc[c] = X_cat_enc[c].astype("float32")
     else:
@@ -276,7 +203,7 @@ def compute_tree_builtin_importance(X, y, num_cols, cat_cols, n_sample=200_000, 
 
     tree = ExtraTreesRegressor(
         n_estimators=200,
-        random_state=random_state,
+        random_state=seed,
         n_jobs=-1,
         max_features="sqrt",
         min_samples_leaf=2
@@ -290,110 +217,85 @@ def compute_tree_builtin_importance(X, y, num_cols, cat_cols, n_sample=200_000, 
 # Main
 # =========================
 def main():
-    print(f"Reading: {INPUT}")
+    print(f"Reading raw CSV: {INPUT}")
     df = pd.read_csv(INPUT, low_memory=False)
 
-    # Safety cleanup
-    if "smoking" in df.columns:
-        df["smoking"] = df["smoking"].fillna("Unknown")
+    # Convert key numeric columns (safe; only changes dtype)
+    numeric_candidates = [
+        "age","exercise_hours_per_week","sleep_hours_per_night","body_mass_index",
+        "blood_pressure_systolic","blood_pressure_diastolic","daily_steps_count",
+        "weekly_work_hours","hobbies_count","social_events_per_month","books_read_per_year",
+        "volunteer_hours_per_month","travel_frequency_per_year","daily_active_minutes_instagram",
+        "sessions_per_day","posts_created_per_week","reels_watched_per_day","stories_viewed_per_day",
+        "likes_given_per_day","comments_written_per_day","dms_sent_per_week","dms_received_per_week",
+        "ads_viewed_per_day","ads_clicked_per_day","time_on_feed_per_day","time_on_explore_per_day",
+        "time_on_messages_per_day","time_on_reels_per_day","followers_count","following_count",
+        "notification_response_rate","account_creation_year","average_session_length_minutes",
+        "linked_accounts_count","user_engagement_score",
+        STRESS_COL, HAPPY_COL
+    ]
+    to_numeric_inplace(df, [c for c in numeric_candidates if c in df.columns])
 
-    # If last_login_date still exists, convert to numeric feature
-    if "last_login_date" in df.columns:
-        dt = pd.to_datetime(df["last_login_date"], errors="coerce")
-        ref_date = dt.max()
-        df["days_since_last_login"] = (ref_date - dt).dt.days
-        if df["days_since_last_login"].isna().any():
-            df["days_since_last_login"] = df["days_since_last_login"].fillna(df["days_since_last_login"].median())
-        df = df.drop(columns=["last_login_date"])
+    # Convert date column IN-PLACE (no new feature name)
+    convert_date_inplace(df, "last_login_date")
 
-    # Optional composite indices
-    df = maybe_engineer_behavior_indices(df)
+    # Build label (psychological_risk) from raw columns (label only)
+    df[TARGET] = build_psychological_risk(df)
 
-    # Build target if needed (example)
-    df = build_psychological_risk_if_needed(df)
-
-    # Drop missing target rows
-    before_rows = len(df)
+    # Drop rows with missing label
+    before = len(df)
     df = df.loc[df[TARGET].notna()].copy()
-    dropped_target_missing = before_rows - len(df)
+    print(f"Rows kept after TARGET non-missing: {len(df):,} (dropped {before-len(df):,})")
 
-    # Prepare X/y with leakage prevention
-    base_drop = [c for c in (DROP_COLS + LEAKAGE_COLS) if c in df.columns]
-    if TARGET in base_drop:
-        base_drop.remove(TARGET)
-
-    X = df.drop(columns=[TARGET] + base_drop, errors="ignore")
-    y = pd.to_numeric(df[TARGET], errors="coerce")
-
-    valid_target_mask = y.notna()
-    X = X.loc[valid_target_mask].copy()
-    y = y.loc[valid_target_mask].astype(float)
+    # Build X using ONLY original columns (minus leakage + ID)
+    drop_cols = [c for c in (DROP_COLS + LEAKAGE_COLS) if c in df.columns]
+    X = df.drop(columns=[TARGET] + drop_cols, errors="ignore")
+    y = df[TARGET].astype(float)
 
     # Detect types
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = [c for c in X.columns if c not in num_cols]
-
-    print("\n===== Dataset summary =====")
-    print(f"Rows after target filtering: {len(X):,}")
-    print(f"Dropped rows with missing TARGET ({TARGET}): {dropped_target_missing:,}")
-    print(f"Total candidate features (excluding target/drop/leakage): {X.shape[1]}")
-    print(f"Numeric: {len(num_cols)}, Categorical: {len(cat_cols)}")
-
-    if X.shape[1] == 0:
-        raise ValueError("No candidate features left after applying DROP_COLS and LEAKAGE_COLS.")
+    num_cols, cat_cols = detect_types(X)
+    print(f"Candidate features: {X.shape[1]} | Numeric: {len(num_cols)} | Categorical: {len(cat_cols)}")
 
     # Compute importances
-    print("\n[1/3] Computing Mutual Information importance...")
-    mi_imp = compute_mi_importance(X, y, num_cols, cat_cols, n_sample=N_SAMPLE_MI, random_state=RANDOM_STATE)
+    print("[1/3] MI importance...")
+    mi = mi_importance(X, y, num_cols, cat_cols, N_SAMPLE_MI, RANDOM_STATE)
 
-    print("[2/3] Computing Elastic Net importance...")
-    enet_imp = compute_elasticnet_importance(X, y, num_cols, cat_cols, n_sample=N_SAMPLE_ENET, random_state=RANDOM_STATE)
+    print("[2/3] Elastic Net importance...")
+    enet = enet_importance(X, y, num_cols, cat_cols, N_SAMPLE_ENET, RANDOM_STATE)
 
-    print("[3/3] Computing ExtraTrees builtin importance...")
-    tree_imp = compute_tree_builtin_importance(X, y, num_cols, cat_cols, n_sample=N_SAMPLE_TREE, random_state=RANDOM_STATE)
+    print("[3/3] ExtraTrees builtin importance...")
+    tree = tree_builtin_importance(X, y, num_cols, cat_cols, N_SAMPLE_TREE, RANDOM_STATE)
 
     # Rank aggregation
-    rank_df = pd.DataFrame({"feature": X.columns.tolist()})
-    rank_df = rank_df.merge(mi_imp.reset_index().rename(columns={"index": "feature"}), on="feature", how="left")
-    rank_df = rank_df.merge(enet_imp.reset_index().rename(columns={"index": "feature"}), on="feature", how="left")
-    rank_df = rank_df.merge(tree_imp.reset_index().rename(columns={"index": "feature"}), on="feature", how="left")
+    rank_df = pd.DataFrame({"feature": X.columns})
+    rank_df = rank_df.merge(mi.reset_index().rename(columns={"index":"feature"}), on="feature", how="left")
+    rank_df = rank_df.merge(enet.reset_index().rename(columns={"index":"feature"}), on="feature", how="left")
+    rank_df = rank_df.merge(tree.reset_index().rename(columns={"index":"feature"}), on="feature", how="left")
 
     for c in ["mi_score", "enet_abscoef", "tree_builtin"]:
         rank_df[c] = rank_df[c].fillna(0.0)
         rank_df[f"rank_{c}"] = rank_df[c].rank(ascending=False, method="average")
 
-    rank_df["avg_rank"] = rank_df[["rank_mi_score", "rank_enet_abscoef", "rank_tree_builtin"]].mean(axis=1)
+    rank_df["avg_rank"] = rank_df[["rank_mi_score","rank_enet_abscoef","rank_tree_builtin"]].mean(axis=1)
+    rank_df = rank_df.sort_values(["avg_rank","tree_builtin","mi_score"], ascending=[True,False,False]).reset_index(drop=True)
+    rank_df["final_rank"] = np.arange(1, len(rank_df)+1)
 
-    rank_df = rank_df.sort_values(
-        ["avg_rank", "tree_builtin", "mi_score"],
-        ascending=[True, False, False]
-    ).reset_index(drop=True)
-    rank_df["final_rank"] = np.arange(1, len(rank_df) + 1)
-
-    # Save ranking
+    # Save outputs
     rank_df.to_csv(OUT_RANK, index=False)
 
-    # Save Top-K list
-    top_features = rank_df.head(TOP_K)["feature"].tolist()
+    top20 = rank_df.head(TOP_K)["feature"].tolist()
     with open(OUT_TOPK, "w", encoding="utf-8") as f:
-        for feat in top_features:
+        for feat in top20:
             f.write(feat + "\n")
 
-    # Print summary
-    print("\n===== Top features (ranked) =====")
-    print(rank_df.head(TOP_K)[[
-        "final_rank", "feature", "mi_score", "enet_abscoef", "tree_builtin", "avg_rank"
-    ]])
+    print("\nTop 20 features (raw-only columns):")
+    for i, feat in enumerate(top20, 1):
+        print(f"{i:02d}. {feat}")
 
-    print("\nSaved files:")
-    print(f"- Ranking CSV: {OUT_RANK}")
-    print(f"- Top-{TOP_K} list: {OUT_TOPK}")
-
-    print("\nNOTE:")
-    print(f"- TARGET = {TARGET}")
-    print(f"- LEAKAGE_COLS excluded = {[c for c in LEAKAGE_COLS if c in df.columns]}")
-    print("- Make sure LEAKAGE_COLS matches how you define psychological_risk.")
-
+    print("\nSaved:")
+    print(f"- {OUT_RANK}")
+    print(f"- {OUT_TOPK}")
+    print("\nNOTE: TARGET is built from stress/happiness as label only; those two columns are excluded from features.")
 
 if __name__ == "__main__":
     main()
