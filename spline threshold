@@ -1,0 +1,403 @@
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.linear_model import LinearRegression
+
+import statsmodels.api as sm
+from patsy import dmatrix
+from scipy.ndimage import gaussian_filter1d
+
+warnings.filterwarnings("ignore")
+
+# =========================
+# 1. 配置
+# =========================
+CSV_PATH = "instagram_usage_lifestyle.csv"
+OUTPUT_DIR = "spline_output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+FEATURE_COLS = [
+    "daily_active_minutes_instagram",
+    "likes_given_per_day",
+    "time_on_feed_per_day",
+    "stories_viewed_per_day",
+    "time_on_reels_per_day",
+    "comments_written_per_day",
+    "dms_received_per_week",
+    "time_on_messages_per_day",
+    "dms_sent_per_week",
+    "ads_viewed_per_day",
+    "time_on_explore_per_day",
+    "sessions_per_day",
+    "user_engagement_score",
+    "reels_watched_per_day",
+    "posts_created_per_week",
+    "average_session_length_minutes",
+]
+
+TARGET = "perceived_stress_score"
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+
+# spline复杂度不要太高，否则容易抖
+SPLINE_DF = 4
+SPLINE_DEGREE = 3
+
+# 分箱数量
+N_BINS = 20
+
+# threshold搜索范围：只在中间分位区间找，避免边界爆炸
+LOW_Q = 0.05
+HIGH_Q = 0.95
+
+# 平滑导数，防止局部噪声影响threshold
+SMOOTH_SIGMA = 2
+
+
+# =========================
+# 2. 工具函数
+# =========================
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+
+def clean_numeric_df(df, cols):
+    out = df.copy()
+    for c in cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def make_spline_basis(x, df=SPLINE_DF, degree=SPLINE_DEGREE):
+    return dmatrix(
+        f"bs(x, df={df}, degree={degree}, include_intercept=False)",
+        {"x": x},
+        return_type="dataframe"
+    )
+
+
+def safe_threshold_detection(x_grid, y_grid):
+    """
+    用最大绝对曲率找threshold，但只在内部找，避免边界不稳定。
+    """
+    if len(x_grid) < 10:
+        return None, None, None, "insufficient_points"
+
+    y_smooth = gaussian_filter1d(y_grid, sigma=SMOOTH_SIGMA)
+
+    d1 = np.gradient(y_smooth, x_grid)
+    d2 = np.gradient(d1, x_grid)
+
+    n = len(x_grid)
+    left = max(3, int(n * 0.1))
+    right = min(n - 4, int(n * 0.9))
+
+    if right <= left:
+        return None, d1, d2, "invalid_search_region"
+
+    inner_idx = np.arange(left, right + 1)
+    best_local = inner_idx[np.argmax(np.abs(d2[inner_idx]))]
+
+    threshold_x = float(x_grid[best_local])
+    return threshold_x, d1, d2, "max_abs_second_derivative"
+
+
+def make_binned_summary(df, col, target, n_bins=N_BINS):
+    """
+    分箱后画均值，避免散点太密看不出趋势。
+    """
+    tmp = df[[col, target]].dropna().copy()
+
+    # 如果唯一值太少，就不用qcut
+    if tmp[col].nunique() < 8:
+        grouped = tmp.groupby(col)[target].agg(["mean", "count"]).reset_index()
+        grouped.rename(columns={col: "x_mid", "mean": "y_mean"}, inplace=True)
+        return grouped[["x_mid", "y_mean", "count"]]
+
+    try:
+        tmp["bin"] = pd.qcut(tmp[col], q=n_bins, duplicates="drop")
+        grouped = tmp.groupby("bin")[target].agg(["mean", "count"]).reset_index()
+
+        x_mid = []
+        for interval in grouped["bin"]:
+            x_mid.append(interval.mid)
+
+        grouped["x_mid"] = x_mid
+        grouped.rename(columns={"mean": "y_mean"}, inplace=True)
+        return grouped[["x_mid", "y_mean", "count"]]
+    except Exception:
+        # 退化方案
+        grouped = tmp.groupby(col)[target].agg(["mean", "count"]).reset_index()
+        grouped.rename(columns={col: "x_mid", "mean": "y_mean"}, inplace=True)
+        return grouped[["x_mid", "y_mean", "count"]]
+
+
+# =========================
+# 3. 读数据
+# =========================
+df = pd.read_csv(CSV_PATH)
+df = clean_numeric_df(df, FEATURE_COLS + [TARGET])
+df = df[FEATURE_COLS + [TARGET]].dropna().reset_index(drop=True)
+
+print(f"Data shape after cleaning: {df.shape}")
+
+train_df, test_df = train_test_split(
+    df,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE
+)
+
+print(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
+
+results = []
+
+# =========================
+# 4. 主循环
+# =========================
+for col in FEATURE_COLS:
+    print(f"\n===== Processing: {col} =====")
+
+    try:
+        # -------------------------
+        # 4.1 训练 / 测试数据
+        # -------------------------
+        X_train = train_df[[col]].values
+        y_train = train_df[TARGET].values
+
+        X_test = test_df[[col]].values
+        y_test = test_df[TARGET].values
+
+        # -------------------------
+        # 4.2 线性模型
+        # -------------------------
+        lin_model = LinearRegression()
+        lin_model.fit(X_train, y_train)
+
+        y_pred_lin = lin_model.predict(X_test)
+        r2_lin = r2_score(y_test, y_pred_lin)
+        rmse_lin = rmse(y_test, y_pred_lin)
+
+        # -------------------------
+        # 4.3 spline模型
+        # -------------------------
+        x_train_flat = X_train.flatten()
+        x_test_flat = X_test.flatten()
+
+        spline_train = make_spline_basis(x_train_flat)
+        spline_test = make_spline_basis(x_test_flat)
+
+        spline_model = sm.OLS(y_train, spline_train).fit()
+
+        y_pred_spline = spline_model.predict(spline_test)
+        r2_spline = r2_score(y_test, y_pred_spline)
+        rmse_spline = rmse(y_test, y_pred_spline)
+
+        # -------------------------
+        # 4.4 绘图范围限制
+        # -------------------------
+        x_low = float(df[col].quantile(LOW_Q))
+        x_high = float(df[col].quantile(HIGH_Q))
+
+        if x_high <= x_low:
+            x_low = float(df[col].min())
+            x_high = float(df[col].max())
+
+        x_grid = np.linspace(x_low, x_high, 300)
+
+        spline_grid = make_spline_basis(x_grid)
+        y_grid_spline = spline_model.predict(spline_grid)
+
+        y_grid_linear = lin_model.predict(x_grid.reshape(-1, 1))
+
+        # -------------------------
+        # 4.5 threshold检测
+        # -------------------------
+        threshold_x, d1, d2, th_method = safe_threshold_detection(x_grid, y_grid_spline)
+
+        if threshold_x is not None:
+            threshold_y = float(np.interp(threshold_x, x_grid, y_grid_spline))
+        else:
+            threshold_y = None
+
+        # -------------------------
+        # 4.6 分箱均值图
+        # -------------------------
+        binned = make_binned_summary(df, col, TARGET, n_bins=N_BINS)
+
+        plt.figure(figsize=(9, 6))
+
+        # 分箱均值点
+        plt.scatter(
+            binned["x_mid"],
+            binned["y_mean"],
+            s=40,
+            alpha=0.8,
+            label="Binned mean stress"
+        )
+
+        # linear line
+        plt.plot(
+            x_grid,
+            y_grid_linear,
+            linewidth=2,
+            label="Linear fit"
+        )
+
+        # spline line
+        plt.plot(
+            x_grid,
+            y_grid_spline,
+            linewidth=2.5,
+            label="Spline fit"
+        )
+
+        # threshold
+        if threshold_x is not None:
+            plt.axvline(
+                threshold_x,
+                linestyle="--",
+                linewidth=2,
+                label=f"Threshold = {threshold_x:.2f}"
+            )
+
+        plt.title(f"{col}: Linear vs Spline")
+        plt.xlabel(col)
+        plt.ylabel("Perceived stress score")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+
+        plot_path = os.path.join(OUTPUT_DIR, f"{col}_clean_plot.png")
+        plt.savefig(plot_path, dpi=180)
+        plt.close()
+
+        # -------------------------
+        # 4.7 导数图
+        # -------------------------
+        if d1 is not None and d2 is not None:
+            plt.figure(figsize=(9, 6))
+            plt.plot(x_grid, d1, linewidth=2, label="First derivative")
+            plt.plot(x_grid, d2, linewidth=2, label="Second derivative")
+
+            if threshold_x is not None:
+                plt.axvline(
+                    threshold_x,
+                    linestyle="--",
+                    linewidth=2,
+                    label=f"Threshold = {threshold_x:.2f}"
+                )
+
+            plt.title(f"{col}: Derivative-based threshold detection")
+            plt.xlabel(col)
+            plt.ylabel("Derivative value")
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
+
+            deriv_path = os.path.join(OUTPUT_DIR, f"{col}_derivatives.png")
+            plt.savefig(deriv_path, dpi=180)
+            plt.close()
+        else:
+            deriv_path = None
+
+        # -------------------------
+        # 4.8 保存结果
+        # -------------------------
+        improve_r2 = r2_spline - r2_lin
+        improve_rmse = rmse_lin - rmse_spline
+
+        if threshold_x is None:
+            nonlinear_pattern = "no_clear_threshold"
+        else:
+            # 简单判断是加速、减速还是转折
+            idx = np.argmin(np.abs(x_grid - threshold_x))
+            if idx > 0 and idx < len(d1) - 1:
+                left_slope = d1[max(0, idx - 5):idx].mean()
+                right_slope = d1[idx:min(len(d1), idx + 5)].mean()
+
+                if right_slope > left_slope + 0.01:
+                    nonlinear_pattern = "accelerating_effect"
+                elif right_slope < left_slope - 0.01:
+                    nonlinear_pattern = "diminishing_returns_or_saturation"
+                else:
+                    nonlinear_pattern = "smooth_curvature_change"
+            else:
+                nonlinear_pattern = "smooth_curvature_change"
+
+        results.append({
+            "feature": col,
+            "R2_linear": r2_lin,
+            "R2_spline": r2_spline,
+            "RMSE_linear": rmse_lin,
+            "RMSE_spline": rmse_spline,
+            "improve_R2": improve_r2,
+            "improve_RMSE": improve_rmse,
+            "threshold_x": threshold_x,
+            "threshold_method": th_method,
+            "nonlinear_pattern": nonlinear_pattern,
+            "linear_coef": float(lin_model.coef_[0]),
+            "linear_intercept": float(lin_model.intercept_),
+            "plot_path": plot_path,
+            "derivative_plot_path": deriv_path,
+        })
+
+        print(f"Linear  -> R2={r2_lin:.4f}, RMSE={rmse_lin:.4f}")
+        print(f"Spline  -> R2={r2_spline:.4f}, RMSE={rmse_spline:.4f}")
+        if threshold_x is not None:
+            print(f"Threshold detected at x = {threshold_x:.2f}")
+        else:
+            print("No clear threshold detected")
+
+    except Exception as e:
+        print(f"Failed on feature {col}: {e}")
+        results.append({
+            "feature": col,
+            "R2_linear": np.nan,
+            "R2_spline": np.nan,
+            "RMSE_linear": np.nan,
+            "RMSE_spline": np.nan,
+            "improve_R2": np.nan,
+            "improve_RMSE": np.nan,
+            "threshold_x": np.nan,
+            "threshold_method": f"error: {str(e)}",
+            "nonlinear_pattern": "error",
+            "linear_coef": np.nan,
+            "linear_intercept": np.nan,
+            "plot_path": None,
+            "derivative_plot_path": None,
+        })
+
+# =========================
+# 5. 汇总输出
+# =========================
+results_df = pd.DataFrame(results)
+
+# 按 spline 相比 linear 的提升排序
+results_df = results_df.sort_values(
+    by=["improve_R2", "improve_RMSE"],
+    ascending=False
+).reset_index(drop=True)
+
+csv_out = os.path.join(OUTPUT_DIR, "spline_vs_linear_clean_results.csv")
+results_df.to_csv(csv_out, index=False, encoding="utf-8-sig")
+
+print("\n===== Summary =====")
+print(results_df[[
+    "feature",
+    "R2_linear",
+    "R2_spline",
+    "RMSE_linear",
+    "RMSE_spline",
+    "improve_R2",
+    "improve_RMSE",
+    "threshold_x",
+    "nonlinear_pattern"
+]])
+
+print(f"\nSaved results to: {csv_out}")
+print(f"Plots saved in: {OUTPUT_DIR}")
