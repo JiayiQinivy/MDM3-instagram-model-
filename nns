@@ -1,0 +1,418 @@
+# =========================
+# COMPLETE COLAB CODE
+# Task:
+# Input  = [perceived_stress_score, one selected feature]
+# Output = the other 10 features
+# =========================
+
+# -------------------------------------------------
+# 0. Mount Google Drive
+# -------------------------------------------------
+from google.colab import drive
+drive.mount('/content/drive')
+
+# -------------------------------------------------
+# 1. Find the CSV file automatically in Google Drive
+# -------------------------------------------------
+import os
+import pandas as pd
+import numpy as np
+
+matches = []
+for root, dirs, files in os.walk('/content/drive/MyDrive'):
+    for f in files:
+        if 'instagram' in f.lower() and f.lower().endswith('.csv'):
+            matches.append(os.path.join(root, f))
+
+print("Found CSV files:")
+for m in matches:
+    print(m)
+
+if len(matches) == 0:
+    raise FileNotFoundError(
+        "No Instagram CSV file found in Google Drive. "
+        "Please upload your file to Google Drive first."
+    )
+
+# Use the first matched file
+file_path = matches[0]
+print("\nUsing file:", file_path)
+
+# -------------------------------------------------
+# 2. Define columns
+# -------------------------------------------------
+features = [
+    "daily_active_minutes_instagram",
+    "stories_viewed_per_day",
+    "likes_given_per_day",
+    "time_on_feed_per_day",
+    "comments_written_per_day",
+    "dms_received_per_week",
+    "ads_viewed_per_day",
+    "user_engagement_score",
+    "reels_watched_per_day",
+    "ads_clicked_per_day",
+    "posts_created_per_week"
+]
+
+target = "perceived_stress_score"
+
+# -------------------------------------------------
+# 3. Check column names first
+# -------------------------------------------------
+all_cols = pd.read_csv(file_path, nrows=0).columns.tolist()
+print("\nColumns in file:")
+print(all_cols)
+
+missing_cols = [c for c in features + [target] if c not in all_cols]
+if missing_cols:
+    raise ValueError(f"Missing required columns: {missing_cols}")
+
+# -------------------------------------------------
+# 4. Load only needed columns
+# -------------------------------------------------
+df = pd.read_csv(
+    file_path,
+    usecols=features + [target],
+    low_memory=False
+)
+
+print("\nOriginal shape:", df.shape)
+
+# Drop missing values
+df = df.dropna().copy()
+print("After dropna:", df.shape)
+
+# Optional sampling to speed up training
+sample_n = 100000
+if len(df) > sample_n:
+    df = df.sample(n=sample_n, random_state=42)
+    print("After sampling:", df.shape)
+
+# -------------------------------------------------
+# 5. Choose one input feature
+# -------------------------------------------------
+input_feature = "daily_active_minutes_instagram"   # change this if needed
+other_features = [f for f in features if f != input_feature]
+
+print("\nInput feature:", input_feature)
+print("Output features:", other_features)
+
+X = df[[target, input_feature]].values
+Y = df[other_features].values
+
+# -------------------------------------------------
+# 6. Standardize data
+# -------------------------------------------------
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+scaler_X = StandardScaler()
+scaler_Y = StandardScaler()
+
+X_scaled = scaler_X.fit_transform(X)
+Y_scaled = scaler_Y.fit_transform(Y)
+
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X_scaled, Y_scaled, test_size=0.2, random_state=42
+)
+
+# -------------------------------------------------
+# 7. Convert to PyTorch tensors and DataLoaders
+# -------------------------------------------------
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("\nUsing device:", device)
+
+X_train = torch.tensor(X_train, dtype=torch.float32)
+Y_train = torch.tensor(Y_train, dtype=torch.float32)
+X_test = torch.tensor(X_test, dtype=torch.float32)
+Y_test = torch.tensor(Y_test, dtype=torch.float32)
+
+train_dataset = TensorDataset(X_train, Y_train)
+test_dataset = TensorDataset(X_test, Y_test)
+
+train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
+
+# -------------------------------------------------
+# 8. Define MLP model
+# -------------------------------------------------
+class MLP(nn.Module):
+    def __init__(self, input_dim=2, output_dim=10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = MLP(input_dim=2, output_dim=len(other_features)).to(device)
+
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# -------------------------------------------------
+# 9. Train the model
+# -------------------------------------------------
+epochs = 20
+
+for epoch in range(epochs):
+    model.train()
+    train_loss = 0.0
+
+    for xb, yb in train_loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        pred = model(xb)
+        loss = criterion(pred, yb)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item() * xb.size(0)
+
+    train_loss /= len(train_loader.dataset)
+
+    model.eval()
+    test_loss = 0.0
+
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            pred = model(xb)
+            loss = criterion(pred, yb)
+
+            test_loss += loss.item() * xb.size(0)
+
+    test_loss /= len(test_loader.dataset)
+
+    print(f"Epoch {epoch+1:02d} | Train MSE: {train_loss:.4f} | Test MSE: {test_loss:.4f}")
+
+# -------------------------------------------------
+# 10. Simulation function
+# Given stress + one feature value,
+# predict the other 10 feature values
+# -------------------------------------------------
+def simulate(stress_value, feature_value):
+    x = np.array([[stress_value, feature_value]], dtype=float)
+    x_scaled = scaler_X.transform(x)
+    x_tensor = torch.tensor(x_scaled, dtype=torch.float32).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        y_scaled = model(x_tensor).cpu().numpy()
+
+    y = scaler_Y.inverse_transform(y_scaled)[0]
+    return dict(zip(other_features, y))
+
+# Example
+print("\nExample simulation:")
+result = simulate(stress_value=5, feature_value=200)
+for k, v in result.items():
+    print(f"{k}: {v:.2f}")
+
+# -------------------------------------------------
+# 11. Plot one output feature against the input feature
+# under fixed stress
+# -------------------------------------------------
+import matplotlib.pyplot as plt
+
+output_feature_to_plot = "time_on_feed_per_day"   # change this if needed
+
+x_min = float(df[input_feature].min())
+x_max = float(df[input_feature].max())
+x_range = np.linspace(x_min, x_max, 60)
+
+preds = []
+for val in x_range:
+    res = simulate(stress_value=5, feature_value=val)
+    preds.append(res[output_feature_to_plot])
+
+plt.figure(figsize=(7, 4))
+plt.plot(x_range, preds)
+plt.xlabel(input_feature)
+plt.ylabel(output_feature_to_plot)
+plt.title(f"Predicted {output_feature_to_plot} under fixed stress")
+plt.grid(True)
+plt.show()
+
+# -------------------------------------------------
+# 12. Optional: save cleaned data
+# -------------------------------------------------
+save_clean_path = "/content/drive/MyDrive/instagram_selected_features_clean.csv"
+df.to_csv(save_clean_path, index=False)
+print("\nCleaned dataset saved to:", save_clean_path)
+
+
+
+
+# =========================
+# 0. Load data (from Drive)
+# =========================
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+
+file_path = "/content/drive/MyDrive/instagram_usage_lifestyle.csv"
+
+features = [
+    "daily_active_minutes_instagram",
+    "stories_viewed_per_day",
+    "likes_given_per_day",
+    "time_on_feed_per_day",
+    "comments_written_per_day",
+    "dms_received_per_week",
+    "ads_viewed_per_day",
+    "user_engagement_score",
+    "reels_watched_per_day",
+    "ads_clicked_per_day",
+    "posts_created_per_week"
+]
+
+target = "perceived_stress_score"
+
+df = pd.read_csv(file_path, usecols=features + [target]).dropna()
+
+# 可选：抽样
+df = df.sample(n=100000, random_state=42)
+
+# =========================
+# 1. Prepare data
+# =========================
+X = df[features + [target]].values
+
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+
+# =========================
+# 2. Masked Autoencoder MLP
+# =========================
+class MaskedMLP(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = MaskedMLP(dim=X.shape[1])
+
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# =========================
+# 3. Training with masking
+# =========================
+epochs = 20
+
+for epoch in range(epochs):
+    model.train()
+
+    # 随机mask（关键🔥）
+    mask = (torch.rand_like(X_tensor) > 0.3).float()
+    X_masked = X_tensor * mask
+
+    pred = model(X_masked)
+
+    loss = criterion(pred, X_tensor)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 5 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+
+# =========================
+# 4. Feature control function
+# =========================
+feature_index = {name: i for i, name in enumerate(features + [target])}
+
+def simulate(control_dict):
+    """
+    control_dict example:
+    {
+        "perceived_stress_score": 5,
+        "daily_active_minutes_instagram": 200,
+        "likes_given_per_day": 150
+    }
+    """
+
+    # 初始化输入（全部设为0）
+    x = np.zeros(len(features) + 1)
+
+    # 填入你控制的变量
+    for k, v in control_dict.items():
+        idx = feature_index[k]
+        x[idx] = v
+
+    # 标准化
+    x_scaled = scaler.transform([x])
+    x_tensor = torch.tensor(x_scaled, dtype=torch.float32)
+
+    # 预测
+    model.eval()
+    with torch.no_grad():
+        pred = model(x_tensor).numpy()
+
+    pred = scaler.inverse_transform(pred)[0]
+
+    result = dict(zip(features + [target], pred))
+    return result
+
+# =========================
+# 5. 示例：你想要的场景🔥
+# =========================
+
+# 情况1：likes = 50
+res1 = simulate({
+    "perceived_stress_score": 5,
+    "daily_active_minutes_instagram": 200,
+    "likes_given_per_day": 50
+})
+
+# 情况2：likes = 150
+res2 = simulate({
+    "perceived_stress_score": 5,
+    "daily_active_minutes_instagram": 200,
+    "likes_given_per_day": 150
+})
+
+print("\n=== Case 1: likes = 50 ===")
+for k, v in res1.items():
+    print(f"{k}: {v:.2f}")
+
+print("\n=== Case 2: likes = 150 ===")
+for k, v in res2.items():
+    print(f"{k}: {v:.2f}")
