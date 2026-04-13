@@ -2,6 +2,6 @@
 instagram_usage_lifestyle.csv
 
 # ignore outputs
-*.pdf
+
 *.csv
 *.parquet
